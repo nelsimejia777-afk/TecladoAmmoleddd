@@ -1,0 +1,1458 @@
+name: Build Teclado Voz
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Crear archivos de Gradle y manifest
+        run: |
+          mkdir -p "$(dirname 'settings.gradle.kts')"
+          cat > 'settings.gradle.kts' <<'__FIN_ARCHIVO__'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "TecladoVoz"
+          include(":app")
+          __FIN_ARCHIVO__
+          mkdir -p "$(dirname 'build.gradle.kts')"
+          cat > 'build.gradle.kts' <<'__FIN_ARCHIVO__'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          __FIN_ARCHIVO__
+          mkdir -p "$(dirname 'gradle.properties')"
+          cat > 'gradle.properties' <<'__FIN_ARCHIVO__'
+          org.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          __FIN_ARCHIVO__
+          mkdir -p "$(dirname 'app/build.gradle.kts')"
+          cat > 'app/build.gradle.kts' <<'__FIN_ARCHIVO__'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.tecladovoz"
+              compileSdk = 34
+              ndkVersion = "26.1.10909125"
+
+              defaultConfig {
+                  applicationId = "com.tecladovoz"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+
+                  ndk {
+                      abiFilters += listOf("arm64-v8a")
+                  }
+                  externalNativeBuild {
+                      cmake {
+                          cppFlags("-std=c++17")
+                          arguments("-DANDROID_STL=c++_static")
+                      }
+                  }
+              }
+
+              externalNativeBuild {
+                  cmake {
+                      path = file("src/main/cpp/CMakeLists.txt")
+                      version = "3.22.1"
+                  }
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                      // Se firma con la clave de depuración para poder instalar el APK directamente.
+                      signingConfig = signingConfigs.getByName("debug")
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+              lint {
+                  checkReleaseBuilds = false
+                  abortOnError = false
+              }
+          }
+          __FIN_ARCHIVO__
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'__FIN_ARCHIVO__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="Teclado Voz"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".KeyboardService"
+                      android:exported="true"
+                      android:label="Teclado Voz"
+                      android:permission="android.permission.BIND_INPUT_METHOD">
+                      <intent-filter>
+                          <action android:name="android.view.InputMethod" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.view.im"
+                          android:resource="@xml/method" />
+                  </service>
+              </application>
+          </manifest>
+          __FIN_ARCHIVO__
+          mkdir -p "$(dirname 'app/src/main/res/xml/method.xml')"
+          cat > 'app/src/main/res/xml/method.xml' <<'__FIN_ARCHIVO__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <input-method xmlns:android="http://schemas.android.com/apk/res/android"
+              android:settingsActivity="com.tecladovoz.MainActivity" />
+          __FIN_ARCHIVO__
+
+      - name: Crear código nativo (C++)
+        run: |
+          mkdir -p "$(dirname 'app/src/main/cpp/CMakeLists.txt')"
+          cat > 'app/src/main/cpp/CMakeLists.txt' <<'__FIN_ARCHIVO__'
+          cmake_minimum_required(VERSION 3.18.1)
+          project(whisperjni C CXX)
+
+          set(CMAKE_C_STANDARD 11)
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+          # whisper.cpp se compila como biblioteca estática dentro de libwhisperjni.so
+          set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+          set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
+          set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
+          set(WHISPER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+          set(WHISPER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+          set(WHISPER_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+
+          # El Samsung A15 (Cortex-A76) soporta ARMv8.2 con fp16 y dotprod: mucho más rápido.
+          if (ANDROID_ABI STREQUAL "arm64-v8a")
+              set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=armv8.2-a+fp16+dotprod")
+              set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=armv8.2-a+fp16+dotprod")
+          endif()
+
+          add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/whisper.cpp ${CMAKE_CURRENT_BINARY_DIR}/whisper_build)
+
+          add_library(whisperjni SHARED whisper_jni.cpp)
+          target_link_libraries(whisperjni whisper log)
+          __FIN_ARCHIVO__
+          mkdir -p "$(dirname 'app/src/main/cpp/whisper_jni.cpp')"
+          cat > 'app/src/main/cpp/whisper_jni.cpp' <<'__FIN_ARCHIVO__'
+          #include <jni.h>
+          #include <android/log.h>
+          #include <string>
+          #include "whisper.h"
+
+          #define TAG "WhisperJNI"
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+          #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+
+          extern "C" {
+
+          JNIEXPORT jlong JNICALL
+          Java_com_tecladovoz_WhisperLib_initContext(JNIEnv *env, jobject /*thiz*/, jstring path) {
+              const char *p = env->GetStringUTFChars(path, nullptr);
+              if (p == nullptr) return 0;
+              whisper_context_params cparams = whisper_context_default_params();
+              cparams.use_gpu = false;
+              whisper_context *ctx = whisper_init_from_file_with_params(p, cparams);
+              if (ctx == nullptr) {
+                  LOGE("No se pudo cargar el modelo: %s", p);
+              } else {
+                  LOGI("Modelo cargado: %s", p);
+              }
+              env->ReleaseStringUTFChars(path, p);
+              return reinterpret_cast<jlong>(ctx);
+          }
+
+          // Devuelve el texto en bytes UTF-8 (se decodifica en Kotlin; evita fallos de JNI
+          // cuando un carácter multibyte queda partido entre tokens).
+          JNIEXPORT jbyteArray JNICALL
+          Java_com_tecladovoz_WhisperLib_transcribe(JNIEnv *env, jobject /*thiz*/, jlong ctxPtr,
+                                                    jfloatArray audio, jint threads, jstring lang) {
+              auto *ctx = reinterpret_cast<whisper_context *>(ctxPtr);
+              if (ctx == nullptr) return nullptr;
+
+              const jsize n = env->GetArrayLength(audio);
+              jfloat *data = env->GetFloatArrayElements(audio, nullptr);
+              if (data == nullptr) return nullptr;
+              const char *l = env->GetStringUTFChars(lang, nullptr);
+              if (l == nullptr) {
+                  env->ReleaseFloatArrayElements(audio, data, JNI_ABORT);
+                  return nullptr;
+              }
+
+              whisper_full_params params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+              params.n_threads = threads;
+              params.language = l;
+              params.translate = false;
+              params.no_context = true;
+              params.single_segment = false;
+              params.print_realtime = false;
+              params.print_progress = false;
+              params.print_timestamps = false;
+              params.print_special = false;
+              params.temperature_inc = 0.0f;  // sin reintentos lentos
+
+              const int rc = whisper_full(ctx, params, data, n);
+
+              std::string out;
+              if (rc == 0) {
+                  const int segments = whisper_full_n_segments(ctx);
+                  for (int i = 0; i < segments; i++) {
+                      const char *t = whisper_full_get_segment_text(ctx, i);
+                      if (t != nullptr) out += t;
+                  }
+              } else {
+                  LOGE("whisper_full devolvió %d", rc);
+              }
+
+              env->ReleaseStringUTFChars(lang, l);
+              env->ReleaseFloatArrayElements(audio, data, JNI_ABORT);
+
+              if (rc != 0) return nullptr;
+
+              jbyteArray arr = env->NewByteArray(static_cast<jsize>(out.size()));
+              if (arr == nullptr) return nullptr;
+              env->SetByteArrayRegion(arr, 0, static_cast<jsize>(out.size()),
+                                      reinterpret_cast<const jbyte *>(out.data()));
+              return arr;
+          }
+
+          JNIEXPORT void JNICALL
+          Java_com_tecladovoz_WhisperLib_freeContext(JNIEnv * /*env*/, jobject /*thiz*/, jlong ctxPtr) {
+              auto *ctx = reinterpret_cast<whisper_context *>(ctxPtr);
+              if (ctx != nullptr) whisper_free(ctx);
+          }
+
+          }  // extern "C"
+          __FIN_ARCHIVO__
+
+      - name: Crear código Kotlin
+        run: |
+          mkdir -p "$(dirname 'app/src/main/java/com/tecladovoz/Cfg.kt')"
+          cat > 'app/src/main/java/com/tecladovoz/Cfg.kt' <<'__FIN_ARCHIVO__'
+          package com.tecladovoz
+
+          import android.content.Context
+
+          /** Ajustes guardados (los comparten la pantalla de ajustes y el teclado). */
+          object Cfg {
+              private fun sp(c: Context) = c.getSharedPreferences("cfg", Context.MODE_PRIVATE)
+
+              fun model(c: Context): String = sp(c).getString("model", "base") ?: "base"
+              fun setModel(c: Context, v: String) = sp(c).edit().putString("model", v).apply()
+
+              fun keyHeight(c: Context): Int = sp(c).getInt("kh", 48).coerceIn(36, 72)
+              fun setKeyHeight(c: Context, v: Int) = sp(c).edit().putInt("kh", v).apply()
+
+              fun threads(c: Context): Int = sp(c).getInt("th", 4).coerceIn(1, 8)
+              fun setThreads(c: Context, v: Int) = sp(c).edit().putInt("th", v).apply()
+
+              fun lang(c: Context): String = sp(c).getString("lang", "es") ?: "es"
+              fun setLang(c: Context, v: String) = sp(c).edit().putString("lang", v).apply()
+          }
+          __FIN_ARCHIVO__
+          mkdir -p "$(dirname 'app/src/main/java/com/tecladovoz/Models.kt')"
+          cat > 'app/src/main/java/com/tecladovoz/Models.kt' <<'__FIN_ARCHIVO__'
+          package com.tecladovoz
+
+          import android.content.Context
+          import java.io.File
+
+          data class ModelInfo(val id: String, val file: String, val size: String)
+
+          object Models {
+              val all = listOf(
+                  ModelInfo("tiny", "ggml-tiny-q5_1.bin", "≈31 MB"),
+                  ModelInfo("base", "ggml-base-q5_1.bin", "≈57 MB"),
+                  ModelInfo("small", "ggml-small-q5_1.bin", "≈181 MB")
+              )
+
+              fun info(id: String): ModelInfo = all.firstOrNull { it.id == id } ?: all[1]
+
+              fun file(c: Context, id: String): File =
+                  File(File(c.filesDir, "models"), info(id).file)
+
+              fun url(id: String): String =
+                  "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/" + info(id).file
+          }
+          __FIN_ARCHIVO__
+          mkdir -p "$(dirname 'app/src/main/java/com/tecladovoz/WhisperLib.kt')"
+          cat > 'app/src/main/java/com/tecladovoz/WhisperLib.kt' <<'__FIN_ARCHIVO__'
+          package com.tecladovoz
+
+          /** Puente JNI hacia whisper.cpp (libwhisperjni.so). */
+          object WhisperLib {
+              val ok: Boolean = try {
+                  System.loadLibrary("whisperjni")
+                  true
+              } catch (e: Throwable) {
+                  false
+              }
+
+              external fun initContext(path: String): Long
+              external fun transcribe(ctx: Long, audio: FloatArray, threads: Int, lang: String): ByteArray?
+              external fun freeContext(ctx: Long)
+          }
+          __FIN_ARCHIVO__
+          mkdir -p "$(dirname 'app/src/main/java/com/tecladovoz/Recorder.kt')"
+          cat > 'app/src/main/java/com/tecladovoz/Recorder.kt' <<'__FIN_ARCHIVO__'
+          package com.tecladovoz
+
+          import android.annotation.SuppressLint
+          import android.media.AudioFormat
+          import android.media.AudioRecord
+          import android.media.MediaRecorder
+          import kotlin.math.max
+          import kotlin.math.sqrt
+
+          /**
+           * Graba SIN INTERRUPCIONES desde que se llama a start() hasta stop().
+           * Nunca se corta por silencio: solo divide el audio en trozos (en las pausas largas)
+           * para ir transcribiendo mientras sigues hablando. No se descarta ningún audio con voz.
+           */
+          class SegmentRecorder(
+              private val onSegment: (FloatArray) -> Unit,
+              private val onEnded: () -> Unit
+          ) {
+              companion object {
+                  const val RATE = 16000
+                  const val FRAME = 1600                 // 100 ms
+                  const val MIN_SEG = 2 * RATE           // un trozo dura al menos 2 s
+                  const val MAX_SEG = 25 * RATE          // y como máximo 25 s
+                  const val SILENCE_FRAMES = 10          // 1 s de silencio = punto de corte
+                  const val PREROLL = RATE / 2           // 0,5 s previos para no comerse la primera palabra
+                  const val MIN_SPEECH_FRAMES = 2        // mínimo 200 ms de voz para transcribir
+              }
+
+              @Volatile
+              private var running = false
+
+              @SuppressLint("MissingPermission")
+              fun start(): Boolean {
+                  val minBuf = AudioRecord.getMinBufferSize(
+                      RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+                  )
+                  if (minBuf <= 0) return false
+                  val size = max(minBuf, RATE * 2 * 2) // 2 s de búfer (en bytes)
+                  val r = try {
+                      AudioRecord(
+                          MediaRecorder.AudioSource.MIC, RATE,
+                          AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, size
+                      )
+                  } catch (e: Exception) {
+                      return false
+                  }
+                  if (r.state != AudioRecord.STATE_INITIALIZED) {
+                      r.release()
+                      return false
+                  }
+                  try {
+                      r.startRecording()
+                  } catch (e: Exception) {
+                      r.release()
+                      return false
+                  }
+                  if (r.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                      r.release()
+                      return false
+                  }
+                  running = true
+                  Thread { loop(r) }.start()
+                  return true
+              }
+
+              fun stop() {
+                  running = false
+              }
+
+              private fun loop(r: AudioRecord) {
+                  val frame = ShortArray(FRAME)
+                  val seg = ShortArray(MAX_SEG + FRAME)
+                  var len = 0
+                  var speech = 0
+                  var silent = 0
+                  var noise = 100.0
+                  try {
+                      while (running) {
+                          val n = r.read(frame, 0, FRAME)
+                          if (n < 0) break
+                          if (n == 0) continue
+
+                          var sum = 0.0
+                          for (i in 0 until n) {
+                              val v = frame[i].toDouble()
+                              sum += v * v
+                          }
+                          val rms = sqrt(sum / n)
+                          val isSpeech = rms > max(250.0, noise * 3.0)
+                          if (isSpeech) {
+                              speech++
+                              silent = 0
+                          } else {
+                              silent++
+                              noise = (noise * 0.95 + rms * 0.05).coerceIn(80.0, 1200.0)
+                          }
+
+                          System.arraycopy(frame, 0, seg, len, n)
+                          len += n
+
+                          if (speech == 0 && len > RATE) {
+                              // Solo silencio: conservar únicamente los últimos 0,5 s
+                              System.arraycopy(seg, len - PREROLL, seg, 0, PREROLL)
+                              len = PREROLL
+                          } else if ((len >= MIN_SEG && silent >= SILENCE_FRAMES && speech > 0) || len >= MAX_SEG) {
+                              emit(seg, len, speech)
+                              len = 0
+                              speech = 0
+                              silent = 0
+                          }
+                      }
+                  } catch (e: Throwable) {
+                      // se termina la grabación; lo grabado hasta aquí se envía abajo
+                  } finally {
+                      try {
+                          r.stop()
+                      } catch (e: Exception) {
+                      }
+                      r.release()
+                      emit(seg, len, speech)
+                      try {
+                          onEnded()
+                      } catch (e: Throwable) {
+                      }
+                  }
+              }
+
+              private fun emit(seg: ShortArray, len: Int, speechFrames: Int) {
+                  if (speechFrames < MIN_SPEECH_FRAMES || len < RATE / 4) return
+                  val out = FloatArray(len)
+                  for (i in 0 until len) out[i] = seg[i] / 32768f
+                  try {
+                      onSegment(out)
+                  } catch (e: Throwable) {
+                  }
+              }
+          }
+          __FIN_ARCHIVO__
+          mkdir -p "$(dirname 'app/src/main/java/com/tecladovoz/KeyboardService.kt')"
+          cat > 'app/src/main/java/com/tecladovoz/KeyboardService.kt' <<'__FIN_ARCHIVO__'
+          package com.tecladovoz
+
+          import android.Manifest
+          import android.annotation.SuppressLint
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.graphics.drawable.GradientDrawable
+          import android.graphics.drawable.StateListDrawable
+          import android.inputmethodservice.InputMethodService
+          import android.os.Handler
+          import android.os.Looper
+          import android.text.InputType
+          import android.view.Gravity
+          import android.view.HapticFeedbackConstants
+          import android.view.KeyEvent
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.inputmethod.EditorInfo
+          import android.view.inputmethod.InputMethodManager
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import java.util.concurrent.Executors
+          import java.util.concurrent.atomic.AtomicInteger
+
+          class KeyboardService : InputMethodService() {
+
+              private companion object {
+                  val GREEN: Int = Color.parseColor("#00E676")
+                  val GREEN_DIM: Int = Color.parseColor("#0B3D1E")
+                  val GREEN_PRESS: Int = Color.parseColor("#12522A")
+                  const val SHIFT_OFF = 0
+                  const val SHIFT_ON = 1
+                  const val SHIFT_LOCK = 2
+              }
+
+              private val main = Handler(Looper.getMainLooper())
+              private val worker = Executors.newSingleThreadExecutor()
+              private val pending = AtomicInteger(0)
+
+              private var statusView: TextView? = null
+              private var micKey: TextView? = null
+              private var shiftKey: TextView? = null
+              private var symKey: TextView? = null
+              private val charKeys = ArrayList<ArrayList<TextView>>()
+              private var builtHeight = -1
+
+              private var symbols = false
+              private var shiftState = SHIFT_OFF
+              private var lastShiftTap = 0L
+
+              private var recorder: SegmentRecorder? = null
+              private var recording = false
+              private var stopping = false
+              private var message = ""
+
+              private val pendingText = StringBuilder()
+              private var pendingTime = 0L
+
+              // Solo se tocan desde el hilo "worker"
+              private var ctx = 0L
+              private var loadedId = ""
+
+              private val letters = listOf(
+                  listOf("q", "w", "e", "r", "t", "y", "u", "i", "o", "p"),
+                  listOf("a", "s", "d", "f", "g", "h", "j", "k", "l", "ñ"),
+                  listOf("z", "x", "c", "v", "b", "n", "m")
+              )
+              private val syms = listOf(
+                  listOf("@", "#", "\$", "_", "&", "-", "+", "(", ")", "/"),
+                  listOf("*", "\"", "'", ":", ";", "!", "?", "¡", "¿", "%"),
+                  listOf("~", "<", ">", "=", "[", "]", "|")
+              )
+
+              // ---------------------------------------------------------------- ciclo de vida
+
+              override fun onEvaluateFullscreenMode(): Boolean = false
+
+              override fun onCreateInputView(): View = buildKeyboard()
+
+              override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
+                  super.onStartInputView(info, restarting)
+                  if (builtHeight != Cfg.keyHeight(this)) setInputView(buildKeyboard())
+                  symbols = false
+                  shiftState = SHIFT_OFF
+                  updateAutoShift()
+                  refreshKeys()
+                  flushPendingText()
+                  preloadModel()
+                  refreshStatus()
+              }
+
+              override fun onFinishInputView(finishingInput: Boolean) {
+                  stopRecording()
+                  super.onFinishInputView(finishingInput)
+              }
+
+              override fun onDestroy() {
+                  recorder?.stop()
+                  recorder = null
+                  try {
+                      worker.execute {
+                          if (ctx != 0L) {
+                              WhisperLib.freeContext(ctx)
+                              ctx = 0L
+                          }
+                      }
+                      worker.shutdown()
+                  } catch (e: Exception) {
+                  }
+                  super.onDestroy()
+              }
+
+              // ---------------------------------------------------------------- interfaz
+
+              @SuppressLint("ClickableViewAccessibility")
+              private fun buildKeyboard(): View {
+                  val d = resources.displayMetrics.density
+                  val h = Cfg.keyHeight(this)
+                  builtHeight = h
+                  charKeys.clear()
+                  val rowH = (h * d).toInt()
+                  val pad = (3 * d).toInt()
+
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setBackgroundColor(Color.BLACK)
+                  root.setPadding(pad, 0, pad, pad * 2)
+
+                  val st = TextView(this)
+                  st.setTextColor(GREEN)
+                  st.textSize = 12f
+                  st.gravity = Gravity.CENTER
+                  root.addView(
+                      st,
+                      LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, (22 * d).toInt())
+                  )
+                  statusView = st
+
+                  // Fila de números (siempre visible)
+                  val numRow = newRow(root, rowH)
+                  for (c in "1234567890") {
+                      val k = newKey(c.toString(), 1f, 20f)
+                      attach(k) { typeText(k.text.toString()) }
+                      numRow.addView(k)
+                  }
+
+                  // Tres filas de letras / símbolos
+                  for (ri in 0..2) {
+                      val row = newRow(root, rowH)
+                      val keys = ArrayList<TextView>()
+                      if (ri == 2) {
+                          val sk = newKey("⇧", 1.5f, 20f)
+                          attach(sk) { onShift() }
+                          row.addView(sk)
+                          shiftKey = sk
+                      }
+                      for (i in letters[ri].indices) {
+                          val k = newKey(letters[ri][i], 1f, 22f)
+                          attach(k, onLong = { longPressChar(k) }) { typeText(k.text.toString()) }
+                          row.addView(k)
+                          keys.add(k)
+                      }
+                      if (ri == 2) {
+                          val bk = newKey("⌫", 1.5f, 20f)
+                          attach(bk, repeat = true) { backspace() }
+                          row.addView(bk)
+                      }
+                      charKeys.add(keys)
+                  }
+
+                  // Fila inferior
+                  val bottom = newRow(root, rowH)
+                  val sym = newKey("?123", 1.3f, 15f)
+                  attach(sym) { toggleSymbols() }
+                  symKey = sym
+                  val globe = newKey("🌐", 1f, 18f)
+                  attach(globe) { showPicker() }
+                  val mic = newKey("🎤", 1.8f, 22f)
+                  attach(mic) { toggleMic() }
+                  micKey = mic
+                  val comma = newKey(",", 0.9f, 22f)
+                  attach(comma) { typeText(",") }
+                  val space = newKey("espacio", 3f, 13f)
+                  attach(space) { typeText(" ") }
+                  val dot = newKey(".", 0.9f, 22f)
+                  attach(dot) { typeText(".") }
+                  val enter = newKey("↵", 1.3f, 20f)
+                  attach(enter) { pressEnter() }
+                  for (k in listOf(sym, globe, mic, comma, space, dot, enter)) bottom.addView(k)
+
+                  refreshKeys()
+                  refreshMicUi()
+                  refreshStatus()
+                  return root
+              }
+
+              private fun newRow(parent: LinearLayout, rowH: Int): LinearLayout {
+                  val row = LinearLayout(this)
+                  row.orientation = LinearLayout.HORIZONTAL
+                  parent.addView(
+                      row,
+                      LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, rowH)
+                  )
+                  return row
+              }
+
+              private fun newKey(label: String, weight: Float, sizeSp: Float): TextView {
+                  val d = resources.displayMetrics.density
+                  val tv = TextView(this)
+                  tv.text = label
+                  tv.textSize = sizeSp
+                  tv.setTextColor(GREEN)
+                  tv.gravity = Gravity.CENTER
+                  tv.setSingleLine(true)
+                  tv.includeFontPadding = false
+                  tv.setPadding(0, 0, 0, 0)
+                  tv.background = keyBg(false)
+                  val lp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, weight)
+                  val m = (2 * d).toInt()
+                  lp.setMargins(m, m, m, m)
+                  tv.layoutParams = lp
+                  return tv
+              }
+
+              private fun keyBg(filled: Boolean): StateListDrawable {
+                  val d = resources.displayMetrics.density
+                  fun shape(fill: Int, stroke: Int): GradientDrawable {
+                      val g = GradientDrawable()
+                      g.shape = GradientDrawable.RECTANGLE
+                      g.cornerRadius = 8 * d
+                      g.setColor(fill)
+                      g.setStroke(d.toInt().coerceAtLeast(1), stroke)
+                      return g
+                  }
+
+                  val sl = StateListDrawable()
+                  sl.addState(intArrayOf(android.R.attr.state_pressed), shape(GREEN_PRESS, GREEN))
+                  sl.addState(intArrayOf(), shape(if (filled) GREEN else Color.BLACK, GREEN_DIM))
+                  return sl
+              }
+
+              /** Tecla táctil: pulsar = acción; mantener = acción larga; repeat = repetir al mantener. */
+              @SuppressLint("ClickableViewAccessibility")
+              private fun attach(
+                  v: View,
+                  repeat: Boolean = false,
+                  onLong: (() -> Unit)? = null,
+                  onTap: () -> Unit
+              ) {
+                  var longFired = false
+                  val longRun = Runnable {
+                      longFired = true
+                      v.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                      onLong?.invoke()
+                  }
+                  val repRun = object : Runnable {
+                      override fun run() {
+                          onTap()
+                          main.postDelayed(this, 50)
+                      }
+                  }
+                  v.setOnTouchListener { view, ev ->
+                      when (ev.actionMasked) {
+                          MotionEvent.ACTION_DOWN -> {
+                              view.isPressed = true
+                              longFired = false
+                              view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                              if (repeat) {
+                                  onTap()
+                                  main.postDelayed(repRun, 400)
+                              } else if (onLong != null) {
+                                  main.postDelayed(longRun, 380)
+                              }
+                          }
+                          MotionEvent.ACTION_UP -> {
+                              view.isPressed = false
+                              main.removeCallbacks(longRun)
+                              main.removeCallbacks(repRun)
+                              if (!repeat && !longFired) onTap()
+                          }
+                          MotionEvent.ACTION_CANCEL -> {
+                              view.isPressed = false
+                              main.removeCallbacks(longRun)
+                              main.removeCallbacks(repRun)
+                          }
+                      }
+                      true
+                  }
+              }
+
+              private fun refreshKeys() {
+                  val table = if (symbols) syms else letters
+                  val upper = !symbols && shiftState != SHIFT_OFF
+                  for (ri in charKeys.indices) {
+                      for (i in charKeys[ri].indices) {
+                          val base = table[ri][i]
+                          charKeys[ri][i].text = if (upper) base.uppercase() else base
+                      }
+                  }
+                  symKey?.text = if (symbols) "ABC" else "?123"
+                  shiftKey?.alpha = if (symbols) 0.3f else 1f
+                  refreshShiftUi()
+              }
+
+              private fun refreshShiftUi() {
+                  val k = shiftKey ?: return
+                  when (shiftState) {
+                      SHIFT_OFF -> {
+                          k.text = "⇧"
+                          k.background = keyBg(false)
+                          k.setTextColor(GREEN)
+                      }
+                      SHIFT_ON -> {
+                          k.text = "⇧"
+                          k.background = keyBg(true)
+                          k.setTextColor(Color.BLACK)
+                      }
+                      else -> {
+                          k.text = "⇧⇧"
+                          k.background = keyBg(true)
+                          k.setTextColor(Color.BLACK)
+                      }
+                  }
+              }
+
+              private fun refreshMicUi() {
+                  val k = micKey ?: return
+                  if (recording) {
+                      k.text = "■"
+                      k.background = keyBg(true)
+                      k.setTextColor(Color.BLACK)
+                  } else {
+                      k.text = "🎤"
+                      k.background = keyBg(false)
+                      k.setTextColor(GREEN)
+                  }
+              }
+
+              private fun refreshStatus() {
+                  val tv = statusView ?: return
+                  val busy = pending.get() > 0
+                  tv.text = when {
+                      recording -> if (busy) "● Escuchando · transcribiendo…" else "● Escuchando…"
+                      stopping || busy -> "Transcribiendo…"
+                      else -> message
+                  }
+              }
+
+              private fun showMessage(msg: String) {
+                  message = msg
+                  refreshStatus()
+                  main.postDelayed({
+                      if (message == msg) {
+                          message = ""
+                          refreshStatus()
+                      }
+                  }, 4000)
+              }
+
+              // ---------------------------------------------------------------- escritura
+
+              private fun typeText(s: String) {
+                  val ic = currentInputConnection ?: return
+                  ic.commitText(s, 1)
+                  val before = shiftState
+                  if (shiftState == SHIFT_ON) shiftState = SHIFT_OFF
+                  updateAutoShift()
+                  if (before != shiftState) refreshKeys()
+              }
+
+              private fun backspace() {
+                  if (currentInputConnection == null) return
+                  sendDownUpKeyEvents(KeyEvent.KEYCODE_DEL)
+                  val before = shiftState
+                  updateAutoShift()
+                  if (before != shiftState) refreshKeys()
+              }
+
+              private fun pressEnter() {
+                  val ic = currentInputConnection ?: return
+                  val ei = currentInputEditorInfo
+                  val action = if (ei != null) ei.imeOptions and EditorInfo.IME_MASK_ACTION else EditorInfo.IME_ACTION_NONE
+                  val noEnterAction = ei != null && (ei.imeOptions and EditorInfo.IME_FLAG_NO_ENTER_ACTION) != 0
+                  if (!noEnterAction && action != EditorInfo.IME_ACTION_NONE && action != EditorInfo.IME_ACTION_UNSPECIFIED) {
+                      ic.performEditorAction(action)
+                  } else {
+                      sendDownUpKeyEvents(KeyEvent.KEYCODE_ENTER)
+                  }
+                  val before = shiftState
+                  updateAutoShift()
+                  if (before != shiftState) refreshKeys()
+              }
+
+              private fun longPressChar(k: TextView) {
+                  if (symbols) return
+                  val t = k.text.toString()
+                  val acc: String = when (t.lowercase()) {
+                      "a" -> "á"
+                      "e" -> "é"
+                      "i" -> "í"
+                      "o" -> "ó"
+                      "u" -> "ú"
+                      else -> return
+                  }
+                  typeText(if (t != t.lowercase()) acc.uppercase() else acc)
+              }
+
+              private fun onShift() {
+                  if (symbols) return
+                  val now = System.currentTimeMillis()
+                  shiftState = when {
+                      shiftState == SHIFT_LOCK -> SHIFT_OFF
+                      now - lastShiftTap < 350 -> SHIFT_LOCK
+                      shiftState == SHIFT_ON -> SHIFT_OFF
+                      else -> SHIFT_ON
+                  }
+                  lastShiftTap = now
+                  refreshKeys()
+              }
+
+              private fun toggleSymbols() {
+                  symbols = !symbols
+                  refreshKeys()
+              }
+
+              private fun updateAutoShift() {
+                  if (shiftState == SHIFT_LOCK || symbols) return
+                  val ei = currentInputEditorInfo
+                  val ic = currentInputConnection
+                  var on = false
+                  if (ei != null && ic != null &&
+                      (ei.inputType and InputType.TYPE_MASK_CLASS) == InputType.TYPE_CLASS_TEXT
+                  ) {
+                      on = ic.getCursorCapsMode(ei.inputType) != 0
+                  }
+                  shiftState = if (on) SHIFT_ON else SHIFT_OFF
+              }
+
+              private fun showPicker() {
+                  try {
+                      (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager).showInputMethodPicker()
+                  } catch (e: Exception) {
+                  }
+              }
+
+              // ---------------------------------------------------------------- voz
+
+              private fun toggleMic() {
+                  if (recording) stopRecording() else startRecording()
+              }
+
+              private fun startRecording() {
+                  if (recording || stopping) return
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                      openApp("Falta el permiso del micrófono")
+                      return
+                  }
+                  if (!Models.file(this, Cfg.model(this)).exists()) {
+                      openApp("Falta descargar el modelo de Whisper")
+                      return
+                  }
+                  if (!WhisperLib.ok) {
+                      showMessage("Error: no se pudo cargar Whisper")
+                      return
+                  }
+                  preloadModel()
+
+                  var self: SegmentRecorder? = null
+                  val rec = SegmentRecorder(
+                      onSegment = { audio -> submit(audio) },
+                      onEnded = {
+                          main.post {
+                              if (recorder === self) {
+                                  recorder = null
+                                  recording = false
+                              }
+                              stopping = false
+                              refreshMicUi()
+                              refreshStatus()
+                          }
+                      }
+                  )
+                  self = rec
+                  if (!rec.start()) {
+                      showMessage("No se pudo abrir el micrófono")
+                      return
+                  }
+                  recorder = rec
+                  recording = true
+                  message = ""
+                  refreshMicUi()
+                  refreshStatus()
+              }
+
+              private fun stopRecording() {
+                  val r = recorder ?: return
+                  if (!recording) return
+                  recording = false
+                  stopping = true
+                  recorder = null
+                  r.stop()
+                  refreshMicUi()
+                  refreshStatus()
+              }
+
+              /** Envía un trozo de audio a Whisper (cola en orden, un solo hilo). */
+              private fun submit(audio: FloatArray) {
+                  pending.incrementAndGet()
+                  main.post { refreshStatus() }
+                  val a = if (audio.size < 17600) audio.copyOf(17600) else audio
+                  try {
+                      worker.execute {
+                          var text = ""
+                          try {
+                              if (ensureModel()) {
+                                  val bytes = WhisperLib.transcribe(ctx, a, Cfg.threads(this), Cfg.lang(this))
+                                  if (bytes != null) text = String(bytes, Charsets.UTF_8)
+                              }
+                          } catch (e: Throwable) {
+                              main.post { showMessage("Error al transcribir") }
+                          }
+                          main.post {
+                              pending.decrementAndGet()
+                              if (text.isNotBlank()) commitDictation(text)
+                              refreshStatus()
+                          }
+                      }
+                  } catch (e: Exception) {
+                      pending.decrementAndGet()
+                  }
+              }
+
+              /** Solo se llama desde el hilo "worker". */
+              private fun ensureModel(): Boolean {
+                  val id = Cfg.model(this)
+                  if (ctx != 0L && loadedId == id) return true
+                  if (ctx != 0L) {
+                      WhisperLib.freeContext(ctx)
+                      ctx = 0L
+                      loadedId = ""
+                  }
+                  val f = Models.file(this, id)
+                  if (!f.exists()) {
+                      main.post { showMessage("Falta el modelo $id") }
+                      return false
+                  }
+                  ctx = WhisperLib.initContext(f.absolutePath)
+                  if (ctx == 0L) {
+                      main.post { showMessage("No se pudo cargar el modelo") }
+                      return false
+                  }
+                  loadedId = id
+                  return true
+              }
+
+              private fun preloadModel() {
+                  if (!WhisperLib.ok) return
+                  if (!Models.file(this, Cfg.model(this)).exists()) return
+                  try {
+                      worker.execute {
+                          try {
+                              ensureModel()
+                          } catch (e: Throwable) {
+                          }
+                      }
+                  } catch (e: Exception) {
+                  }
+              }
+
+              private fun cleanText(raw: String): String =
+                  raw.replace(Regex("\\[[^\\]]*\\]"), "")
+                      .replace("♪", "")
+                      .replace(Regex("\\s+"), " ")
+                      .trim()
+
+              private fun commitDictation(raw: String) {
+                  var t = cleanText(raw)
+                  if (t.isEmpty()) return
+                  val ic = currentInputConnection
+                  if (ic == null) {
+                      // El campo se cerró antes de terminar: se guarda unos segundos para el siguiente.
+                      if (pendingText.isNotEmpty()) pendingText.append(' ')
+                      pendingText.append(t)
+                      pendingTime = System.currentTimeMillis()
+                      return
+                  }
+                  val before = ic.getTextBeforeCursor(1, 0)
+                  if (!before.isNullOrEmpty()) {
+                      val c = before[0]
+                      if (!c.isWhitespace() && "([{¿¡\"'".indexOf(c) < 0) t = " $t"
+                  }
+                  ic.commitText(t, 1)
+                  val prev = shiftState
+                  updateAutoShift()
+                  if (prev != shiftState) refreshKeys()
+              }
+
+              private fun flushPendingText() {
+                  if (pendingText.isEmpty()) return
+                  val fresh = System.currentTimeMillis() - pendingTime < 15000
+                  val txt = pendingText.toString()
+                  pendingText.setLength(0)
+                  if (!fresh) return
+                  currentInputConnection?.commitText(txt, 1)
+              }
+
+              private fun openApp(msg: String) {
+                  showMessage(msg)
+                  try {
+                      val i = Intent(this, MainActivity::class.java)
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      i.putExtra("msg", msg)
+                      startActivity(i)
+                  } catch (e: Exception) {
+                  }
+              }
+          }
+          __FIN_ARCHIVO__
+          mkdir -p "$(dirname 'app/src/main/java/com/tecladovoz/MainActivity.kt')"
+          cat > 'app/src/main/java/com/tecladovoz/MainActivity.kt' <<'__FIN_ARCHIVO__'
+          package com.tecladovoz
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.content.res.ColorStateList
+          import android.graphics.Color
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.Settings
+          import android.text.InputType
+          import android.view.Gravity
+          import android.view.ViewGroup
+          import android.view.inputmethod.InputMethodManager
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.SeekBar
+          import android.widget.TextView
+          import android.widget.Toast
+          import java.io.File
+          import java.io.FileOutputStream
+          import java.io.IOException
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          class MainActivity : Activity() {
+
+              private val green = Color.parseColor("#00E676")
+              private val dim = Color.parseColor("#0B3D1E")
+              private val ui = Handler(Looper.getMainLooper())
+
+              private lateinit var tvKeyboard: TextView
+              private lateinit var tvMic: TextView
+              private lateinit var tvModel: TextView
+              private lateinit var btnDownload: Button
+              private lateinit var btnLang: Button
+              private val modelButtons = LinkedHashMap<String, Button>()
+
+              @Volatile
+              private var downloadingId: String? = null
+
+              @Volatile
+              private var progressText = ""
+
+              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.statusBarColor = Color.BLACK
+                  window.navigationBarColor = Color.BLACK
+
+                  val scroll = ScrollView(this)
+                  scroll.setBackgroundColor(Color.BLACK)
+                  val col = LinearLayout(this)
+                  col.orientation = LinearLayout.VERTICAL
+                  col.setPadding(dp(18), dp(24), dp(18), dp(40))
+                  scroll.addView(col)
+                  setContentView(scroll)
+
+                  addText(col, "Teclado Voz", 26f, true)
+                  val msg = intent.getStringExtra("msg")
+                  if (msg != null) addText(col, "⚠ $msg", 15f, true)
+
+                  addText(col, "1. Activar el teclado", 17f, true)
+                  tvKeyboard = addText(col, "", 14f, false)
+                  addButton(col, "Abrir ajustes de teclados") {
+                      startActivity(Intent(Settings.ACTION_INPUT_METHOD_SETTINGS))
+                  }
+                  addButton(col, "Elegir Teclado Voz como teclado activo") {
+                      (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager).showInputMethodPicker()
+                  }
+
+                  addText(col, "2. Permiso del micrófono", 17f, true)
+                  tvMic = addText(col, "", 14f, false)
+                  addButton(col, "Dar permiso del micrófono") {
+                      requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1)
+                  }
+
+                  addText(col, "3. Modelo de Whisper (se descarga una sola vez)", 17f, true)
+                  val mrow = LinearLayout(this)
+                  mrow.orientation = LinearLayout.HORIZONTAL
+                  col.addView(mrow, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+                  for (m in Models.all) {
+                      val b = Button(this)
+                      b.text = m.id
+                      val lp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                      lp.setMargins(dp(3), dp(3), dp(3), dp(3))
+                      b.setOnClickListener {
+                          Cfg.setModel(this, m.id)
+                          refresh()
+                      }
+                      mrow.addView(b, lp)
+                      modelButtons[m.id] = b
+                  }
+                  tvModel = addText(col, "", 14f, false)
+                  btnDownload = addButton(col, "") { download(Cfg.model(this)) }
+
+                  addText(col, "4. Ajustes", 17f, true)
+                  val tvSize = addText(col, "Tamaño de las teclas: ${Cfg.keyHeight(this)} dp", 14f, false)
+                  val sbSize = SeekBar(this)
+                  sbSize.max = 36
+                  sbSize.progress = Cfg.keyHeight(this) - 36
+                  tint(sbSize)
+                  sbSize.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                          Cfg.setKeyHeight(this@MainActivity, p + 36)
+                          tvSize.text = "Tamaño de las teclas: ${p + 36} dp"
+                      }
+
+                      override fun onStartTrackingTouch(s: SeekBar?) {}
+                      override fun onStopTrackingTouch(s: SeekBar?) {}
+                  })
+                  col.addView(sbSize)
+
+                  val tvThreads = addText(col, "Hilos de CPU para transcribir: ${Cfg.threads(this)}", 14f, false)
+                  val sbThreads = SeekBar(this)
+                  sbThreads.max = 7
+                  sbThreads.progress = Cfg.threads(this) - 1
+                  tint(sbThreads)
+                  sbThreads.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                          Cfg.setThreads(this@MainActivity, p + 1)
+                          tvThreads.text = "Hilos de CPU para transcribir: ${p + 1}"
+                      }
+
+                      override fun onStartTrackingTouch(s: SeekBar?) {}
+                      override fun onStopTrackingTouch(s: SeekBar?) {}
+                  })
+                  col.addView(sbThreads)
+
+                  btnLang = addButton(col, "") {
+                      val next = when (Cfg.lang(this)) {
+                          "es" -> "en"
+                          "en" -> "auto"
+                          else -> "es"
+                      }
+                      Cfg.setLang(this, next)
+                      refresh()
+                  }
+
+                  addText(col, "5. Prueba el teclado aquí", 17f, true)
+                  val et = EditText(this)
+                  et.setTextColor(green)
+                  et.setHintTextColor(Color.parseColor("#3C8D5A"))
+                  et.hint = "Escribe o dicta aquí…"
+                  et.minLines = 3
+                  et.gravity = Gravity.TOP
+                  et.inputType = InputType.TYPE_CLASS_TEXT or
+                          InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                          InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+                  et.background = border(false)
+                  et.setPadding(dp(12), dp(12), dp(12), dp(12))
+                  col.addView(et, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+                  refresh()
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  refresh()
+              }
+
+              override fun onRequestPermissionsResult(
+                  requestCode: Int,
+                  permissions: Array<out String>,
+                  grantResults: IntArray
+              ) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  refresh()
+              }
+
+              // ---------------------------------------------------------------- utilidades de UI
+
+              private fun border(selected: Boolean): GradientDrawable {
+                  val g = GradientDrawable()
+                  g.cornerRadius = dp(8).toFloat()
+                  g.setColor(if (selected) green else Color.BLACK)
+                  g.setStroke(dp(1).coerceAtLeast(1), if (selected) green else dim)
+                  return g
+              }
+
+              private fun styleBtn(b: Button, selected: Boolean) {
+                  b.background = border(selected)
+                  b.setTextColor(if (selected) Color.BLACK else green)
+                  b.isAllCaps = false
+              }
+
+              private fun addText(parent: LinearLayout, t: String, sp: Float, bold: Boolean): TextView {
+                  val tv = TextView(this)
+                  tv.text = t
+                  tv.textSize = sp
+                  tv.setTextColor(green)
+                  if (bold) tv.setTypeface(tv.typeface, android.graphics.Typeface.BOLD)
+                  val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                  lp.topMargin = dp(if (bold) 18 else 6)
+                  parent.addView(tv, lp)
+                  return tv
+              }
+
+              private fun addButton(parent: LinearLayout, label: String, onClick: () -> Unit): Button {
+                  val b = Button(this)
+                  b.text = label
+                  styleBtn(b, false)
+                  b.setOnClickListener { onClick() }
+                  val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                  lp.topMargin = dp(6)
+                  parent.addView(b, lp)
+                  return b
+              }
+
+              private fun tint(s: SeekBar) {
+                  s.progressTintList = ColorStateList.valueOf(green)
+                  s.thumbTintList = ColorStateList.valueOf(green)
+              }
+
+              private fun langName(code: String): String = when (code) {
+                  "es" -> "Español"
+                  "en" -> "Inglés"
+                  else -> "Automático"
+              }
+
+              private fun refresh() {
+                  val imm = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
+                  val enabled = imm.enabledInputMethodList.any { it.packageName == packageName }
+                  val current = Settings.Secure.getString(contentResolver, Settings.Secure.DEFAULT_INPUT_METHOD) ?: ""
+                  val selected = current.startsWith("$packageName/")
+                  tvKeyboard.text = (if (enabled) "✓ Activado" else "✗ Sin activar") +
+                          "   |   " + (if (selected) "✓ En uso" else "✗ No es el teclado en uso")
+
+                  val granted = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+                  tvMic.text = if (granted) "✓ Permiso concedido" else "✗ Sin permiso"
+
+                  val sel = Cfg.model(this)
+                  for ((id, b) in modelButtons) styleBtn(b, id == sel)
+                  val info = Models.info(sel)
+                  val exists = Models.file(this, sel).exists()
+                  val dl = downloadingId
+                  tvModel.text = "Modelo ${info.id} (${info.size}): " + when {
+                      dl == sel -> progressText
+                      exists -> "descargado ✓"
+                      else -> "sin descargar"
+                  }
+                  btnDownload.isEnabled = dl == null && !exists
+                  btnDownload.alpha = if (btnDownload.isEnabled) 1f else 0.5f
+                  btnDownload.text = if (exists) "Modelo listo ✓" else "Descargar modelo ${info.id}"
+                  btnLang.text = "Idioma del dictado: ${langName(Cfg.lang(this))} (toca para cambiar)"
+              }
+
+              // ---------------------------------------------------------------- descarga del modelo
+
+              private fun download(id: String) {
+                  if (downloadingId != null) return
+                  downloadingId = id
+                  progressText = "descargando 0%"
+                  refresh()
+                  Thread {
+                      val dest = Models.file(this, id)
+                      val part = File(dest.path + ".part")
+                      var error: String? = null
+                      try {
+                          dest.parentFile?.mkdirs()
+                          val conn = URL(Models.url(id)).openConnection() as HttpURLConnection
+                          conn.connectTimeout = 20000
+                          conn.readTimeout = 30000
+                          conn.instanceFollowRedirects = true
+                          conn.connect()
+                          if (conn.responseCode != 200) throw IOException("HTTP ${conn.responseCode}")
+                          val total = conn.contentLengthLong
+                          var done = 0L
+                          var lastPct = -1
+                          conn.inputStream.use { input ->
+                              FileOutputStream(part).use { out ->
+                                  val buf = ByteArray(64 * 1024)
+                                  while (true) {
+                                      val n = input.read(buf)
+                                      if (n < 0) break
+                                      out.write(buf, 0, n)
+                                      done += n
+                                      val pct = if (total > 0) (done * 100 / total).toInt() else -1
+                                      if (pct != lastPct) {
+                                          lastPct = pct
+                                          progressText = if (pct >= 0) "descargando $pct%" else "descargando ${done / 1024 / 1024} MB"
+                                          ui.post { refresh() }
+                                      }
+                                  }
+                              }
+                          }
+                          if (total > 0 && part.length() != total) throw IOException("descarga incompleta")
+                          if (dest.exists()) dest.delete()
+                          if (!part.renameTo(dest)) throw IOException("no se pudo guardar el archivo")
+                      } catch (e: Exception) {
+                          error = e.message ?: "error desconocido"
+                          part.delete()
+                      }
+                      downloadingId = null
+                      ui.post {
+                          refresh()
+                          if (error != null) {
+                              Toast.makeText(this, "Error al descargar: $error", Toast.LENGTH_LONG).show()
+                          }
+                      }
+                  }.start()
+              }
+          }
+          __FIN_ARCHIVO__
+
+      - name: Instalar NDK y CMake
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "ndk;26.1.10909125" "cmake;3.22.1" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Descargar whisper.cpp
+        run: |
+          ok=0
+          for tag in v1.7.4 v1.7.3 v1.7.2; do
+            if git clone --depth 1 --branch "$tag" https://github.com/ggml-org/whisper.cpp.git app/src/main/cpp/whisper.cpp; then
+              echo "whisper.cpp $tag"
+              ok=1
+              break
+            fi
+          done
+          test "$ok" = "1"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Crear clave de depuración
+        run: |
+          mkdir -p ~/.android
+          if [ ! -f ~/.android/debug.keystore ]; then
+            keytool -genkeypair -v -keystore ~/.android/debug.keystore \
+              -storepass android -keypass android -alias androiddebugkey \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      - name: Compilar APK
+        run: gradle assembleRelease --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TecladoVoz-apk
+          path: app/build/outputs/apk/release/*.apk
